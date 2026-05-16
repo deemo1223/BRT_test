@@ -1,201 +1,105 @@
-#include <iostream>
-#include <iomanip>
-#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <sys/time.h>
-#include <linux/can.h>
-#include <linux/can/raw.h>
-#include <net/if.h>
-#include <cmath>
+#include <exception>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
-bool set_up_can_interface(const std::string& interface_name, int bitrate){
-    // check input bit rate
-    if (bitrate <= 0){
-        std::cerr << "Invalid bit rate: "<< bitrate << std::endl;
-        return false;
+#include "brt_sensor.hpp"
+#include "can_interface.hpp"
+#include "force_estimator.hpp"
+#include "sensor_array.hpp"
+
+namespace {
+
+// Keep the main loop running until Ctrl+C requests shutdown.
+std::atomic<bool> g_running{true};
+
+// Flip the loop flag when SIGINT is received.
+void handleSignal(int signal_number) {
+    if (signal_number == SIGINT) {
+        g_running = false;
     }
-
-    // send system command to first set down CAN interface
-    std::string down_cmd = 
-        "ip link set " + interface_name + " down";
-
-    std::system(down_cmd.c_str());
-
-    // send system command to set up CAN interface
-    std::string up_cmd = 
-        "ip link set " + interface_name + 
-        " up type can bitrate " + std::to_string(bitrate) + 
-        " restart-ms 100";
-    
-    int ret = std::system(up_cmd.c_str());
-    if (ret != 0){
-        std::cerr << "Failed to bring up "<< interface_name << ".\n"
-                  << "Please run this program with sudo."
-                  << std::endl;
-        return false;
-    }
-
-    std::cout << interface_name << " is up at " << std::to_string(bitrate) << " bps" << std::endl;
-    
-    return true;
 }
 
+// Print the current sensor state and placeholder wrench in one line.
+void printStatus(const RawCountArray& counts,
+                 const LengthArray& lengths,
+                 const ForceResult& wrench,
+                 bool update_ok) {
+    std::cout << std::fixed << std::setprecision(1);
+    std::cout << (update_ok ? "[OK]  " : "[WARN] ");
+    std::cout << "counts=["
+              << counts[0] << ", "
+              << counts[1] << ", "
+              << counts[2] << ", "
+              << counts[3] << "] ";
+    std::cout << "lengths_mm=["
+              << lengths[0] << ", "
+              << lengths[1] << ", "
+              << lengths[2] << ", "
+              << lengths[3] << "] ";
+    std::cout << "wrench=["
+              << wrench.fx << ", "
+              << wrench.fy << ", "
+              << wrench.fz << ", "
+              << wrench.tx << ", "
+              << wrench.ty << ", "
+              << wrench.tz << "]"
+              << std::endl;
+}
 
-int main()
-{
-    const char* can_interface = "can0";
-    int bitrate = 500000;
+}  // namespace
 
-    if (!set_up_can_interface(can_interface, bitrate)){
-        return 1;
-    }
+int main(int argc, char* argv[]) {
+    // Allow the interface name and bitrate to be overridden from the CLI.
+    const std::string interface_name = (argc > 1) ? argv[1] : "can0";
+    const int bitrate = (argc > 2) ? std::atoi(argv[2]) : 500000;
 
-    const uint8_t device_id = 0x01;
-    const double resolution = 4096.0;
-    const double wheel_circumference_mm = 60.0;
+    // Register Ctrl+C handling before starting the polling loop.
+    std::signal(SIGINT, handleSignal);
 
-    uint32_t zero_count = 0;
+    try {
+        // Open and configure the CAN interface before creating sensors.
+        CANInterface can(interface_name, bitrate);
 
-    int sock = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (sock < 0)
-    {
-        perror("socket");
-        return 1;
-    }
+        // Create the four sensors in their intended CAN ID order.
+        std::vector<BRTSensor> sensors;
+        sensors.emplace_back(0x01, 4096.0, 60.0);
+        sensors.emplace_back(0x02, 4096.0, 60.0);
+        sensors.emplace_back(0x03, 4096.0, 60.0);
+        sensors.emplace_back(0x04, 4096.0, 60.0);
 
-    // 可选：关闭本机发送回环，避免读到自己发出的帧
-    int loopback = 0;
-    setsockopt(sock, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback, sizeof(loopback));
+        // Assemble the polling and estimation objects used by the loop.
+        SensorArray sensor_array(std::move(sensors));
+        ForceEstimator force_estimator;
 
-    // 设置 read 超时，避免一直卡住
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;  // 100 ms
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // Run at a modest rate that is easy on the bus and console output.
+        constexpr auto loop_period = std::chrono::milliseconds(20);
 
-    struct ifreq ifr;
-    std::strcpy(ifr.ifr_name, can_interface);
+        while (g_running) {
+            // Poll the sensors, estimate the wrench, and print the result.
+            const bool update_ok = sensor_array.update(can);
+            const RawCountArray counts = sensor_array.getRawCounts();
+            const LengthArray lengths = sensor_array.getLengthsMm();
+            const ForceResult wrench = force_estimator.estimate(lengths);
 
-    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0)
-    {
-        perror("ioctl");
-        close(sock);
-        return 1;
-    }
-
-    struct sockaddr_can addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-
-    if (bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
-    {
-        perror("bind");
-        close(sock);
-        return 1;
-    }
-
-    std::cout << "CAN socket opened on " << can_interface << std::endl;
-
-    while (true)
-    {
-        struct can_frame tx_frame;
-        std::memset(&tx_frame, 0, sizeof(tx_frame));
-
-        // BRT 手册读取编码器值：
-        // CAN ID: 0x01
-        // Data: 04 01 01 00
-        tx_frame.can_id = device_id;
-        tx_frame.can_dlc = 4;
-        tx_frame.data[0] = 0x04;
-        tx_frame.data[1] = device_id;
-        tx_frame.data[2] = 0x01;
-        tx_frame.data[3] = 0x00;
-
-        int nbytes = write(sock, &tx_frame, sizeof(tx_frame));
-        if (nbytes != sizeof(tx_frame))
-        {
-            perror("write");
-            usleep(100000);
-            continue;
+            printStatus(counts, lengths, wrench, update_ok);
+            // Sleep to keep the polling loop near the target rate.
+            std::this_thread::sleep_for(loop_period);
         }
-
-        std::cout << "TX: ID=0x"
-                  << std::hex << static_cast<int>(tx_frame.can_id)
-                  << " Data=04 01 01 00"
-                  << std::dec << std::endl;
-
-        bool got_response = false;
-
-        // 尝试在短时间内读取返回帧
-        for (int attempt = 0; attempt < 5; ++attempt)
-        {
-            struct can_frame rx_frame;
-            std::memset(&rx_frame, 0, sizeof(rx_frame));
-
-            nbytes = read(sock, &rx_frame, sizeof(rx_frame));
-
-            if (nbytes < 0)
-            {
-                // 超时或者无数据
-                continue;
-            }
-
-            std::cout << "RX: ID=0x"
-                      << std::hex << rx_frame.can_id
-                      << " Data=";
-
-            for (int i = 0; i < rx_frame.can_dlc; ++i)
-            {
-                std::cout << std::setw(2) << std::setfill('0')
-                          << static_cast<int>(rx_frame.data[i]) << " ";
-            }
-
-            std::cout << std::dec << std::endl;
-
-            // 只处理真正的传感器返回：
-            // Data: 07 01 01 b0 b1 b2 b3
-            if (rx_frame.can_id == device_id &&
-                rx_frame.can_dlc >= 7 &&
-                rx_frame.data[0] == 0x07 &&
-                rx_frame.data[1] == device_id &&
-                rx_frame.data[2] == 0x01)
-            {
-                uint32_t count =
-                    static_cast<uint32_t>(rx_frame.data[3]) |
-                    (static_cast<uint32_t>(rx_frame.data[4]) << 8) |
-                    (static_cast<uint32_t>(rx_frame.data[5]) << 16) |
-                    (static_cast<uint32_t>(rx_frame.data[6]) << 24);
-                
-                // calculate the length to the nearest 0.1mm
-                double length_mm =
-                    (static_cast<double>(count))
-                    * wheel_circumference_mm
-                    / resolution;
-                
-                length_mm = std::round(length_mm * 10.0) / 10.0;
-
-                std::cout << "Raw count: " << count
-                          << " | Length: " << length_mm << " mm"
-                          << std::endl;
-
-                got_response = true;
-                break;
-            }
-        }
-
-        if (!got_response)
-        {
-            std::cout << "No valid sensor response." << std::endl;
-        }
-
-        usleep(100000);  // 100 ms
+    } catch (const std::exception& exception) {
+        // Surface startup or runtime failures with a single fatal message.
+        std::cerr << "Fatal error: " << exception.what() << std::endl;
+        return 1;
     }
 
-    close(sock);
+    // Report normal shutdown after Ctrl+C.
+    std::cout << "Exiting." << std::endl;
     return 0;
 }
-
