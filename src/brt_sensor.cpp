@@ -22,7 +22,7 @@ bool BRTSensor::requestPosition(CANInterface& can) {
 }
 
 // Accept only matching BRT reply frames and decode the little-endian count.
-bool BRTSensor::parseResponse(uint32_t can_id, const std::vector<uint8_t>& data){
+bool BRTSensor::parseResponse(uint32_t can_id, const std::vector<uint8_t>& data) {
     // Ignore frames that do not match this sensor and command format.
     if (can_id != device_id_ || data.size() < 7) {
         return false;
@@ -43,17 +43,15 @@ bool BRTSensor::parseResponse(uint32_t can_id, const std::vector<uint8_t>& data)
         setSoftwareZero();
     }
 
-    // Convert counts relative to zero into rounded 0.1 millimeters.
+    // Convert counts relative to zero into rounded millimeters.
     const double delta_count =
         static_cast<double>(static_cast<int64_t>(raw_count_) - static_cast<int64_t>(zero_count_));
+    const double length = delta_count * wheel_circumference_mm_ / resolution_;
 
-    // remove error data, prevent large values around 0mm
-    double length = delta_count * wheel_circumference_mm_ / resolution_;
-    if (length < 0.0 || length >= 350.0) {
-        length = 0.0;
-    }
     length_mm_ = std::round(length * 10.0) / 10.0;
-
+    // remove error length data
+    length_mm_ = (length_mm_ >= 350.0 || length_mm_ < 0.0) ? length_mm_ : 0.0;
+    
     has_valid_data_ = true;
     return true;
 }
